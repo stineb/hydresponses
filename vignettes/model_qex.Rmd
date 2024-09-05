@@ -21,7 +21,9 @@ library(here)
 library(visdat)
 library(lubridate)
 library(cowplot)
+#remotes::install_github("geco-bern/cwd")
 library(cwd)
+#remotes::install_github("geco-bern/rgeco")
 library(rgeco)
 
 low_pass_filter <- function(vec, tau){
