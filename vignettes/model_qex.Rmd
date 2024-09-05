@@ -1,0 +1,347 @@
+---
+title: "Model Q extremes"
+author: "Beni Stocker"
+date: "2024-09-03"
+output:
+  html_document:
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+  )
+```
+
+Libraries and functions.
+```{r}
+library(tidyverse)
+library(here)
+library(visdat)
+library(lubridate)
+library(cowplot)
+library(cwd)
+library(rgeco)
+
+low_pass_filter <- function(vec, tau){
+  
+  # pad with the first year
+  vec <- c(vec[1:365], vec)
+  
+  vec_lpf <- rep(NA, length(vec))
+  vec_lpf[1] <- vec[1]
+  for (idx in 2:length(vec)){
+    vec_lpf[idx] <- vec_lpf[idx - 1] + (1/tau) * (vec[idx] - vec_lpf[idx - 1])
+  }
+  
+  # remove pad again
+  vec_lpf <- vec_lpf[366:length(vec_lpf)]
+  
+  return(vec_lpf)
+}
+```
+
+## Data
+
+Load data. This is not contained in the repo because not public (yet).
+```{r}
+df <- read_rds(here("data-raw/Catchmentdata_subset.rds"))
+```
+
+Subset to only one catchment for explorations here. Subset years to avoid NAs.
+```{r}
+df_sub <- df |> 
+  mutate(year = year(date)) |> 
+  filter(catchmentnr == 2034 & year >= 1963 & year < 2023)
+```
+
+No data is missing.
+```{r}
+vis_miss(df_sub, warn_large_data = FALSE)
+```
+
+## Get Q-extreme events
+
+Defining as where M7Q_Q347 < 0.
+
+```{r}
+df_sub <- df_sub |> 
+  mutate(qex = ifelse(M7Q_Q347 < 0, 1, 0))
+```
+
+Get low-flow extreme events.
+```{r}
+inst_qex <- rgeco::get_consecutive(
+  df_sub |> 
+    pull(qex),
+  merge_threshold = 7,  # pool events that are less than 7 days apart
+  leng_threshold = 15,
+  do_merge = FALSE
+)
+
+# add start and end dates
+inst_qex <- inst_qex |> 
+  mutate(
+    start = df_sub$date[inst_qex$idx_start],
+    end = df_sub$date[inst_qex$idx_start + inst_qex$len - 1]
+  )
+```
+
+
+## Get CWD
+
+Re-calculate to CWD events.
+
+First, determine `doy_reset` based on wettest month. Here across all catchments to re-set on the same date each year for all catchments (could be done more clever).
+
+The wettest month (number) is:
+
+```{r}
+df_msc <- df_sub |> 
+  mutate(month = month(date)) |> 
+  group_by(month) |> 
+  summarise(PsmltSPASS_pev = mean(PsmltSPASS_pev, na.rm = TRUE))
+
+wettest_month <- df_msc |> 
+  arrange(desc(PsmltSPASS_pev)) |> 
+  slice(1) |> 
+  pull(month)
+
+wettest_month
+```
+
+Visualise for sanity check.
+```{r}
+df_msc |> 
+  ggplot(aes(month, PsmltSPASS_pev)) +
+  geom_line()
+```
+
+```{r}
+out_cwd <- cwd(
+  df_sub,
+  varname_wbal = "PsmltSPASS_pev",
+  varname_date = "date",
+  thresh_terminate = 0,
+  thresh_drop = 0.1,
+  doy_reset = yday(ymd(paste0("2001-", as.character(wettest_month),"-01")))
+)
+```
+
+Retain only long CWD events (longer than 25 days).
+```{r}
+out_cwd$inst <- out_cwd$inst |> 
+  filter(len > 25)
+
+# Add cwd to df
+df_sub <- df_sub |> 
+  left_join(
+    out_cwd$df |> 
+      select(date, deficit),
+    join_by("date")
+  )
+```
+  
+## Visualise with events
+
+Add low-pass-filtered CWD with a tau of 90 days (arbitrary, more or less).
+```{r}
+df_sub <- df_sub |> 
+  mutate(deficit_lpf = low_pass_filter(deficit, tau = 90))
+```
+
+For subset of years. The blue curve is the low-pass-filtered CWD with `tau = 90`.
+```{r}
+# CWD with CWD-events (grey)
+gg1 <- ggplot() +
+  geom_rect(
+    data = out_cwd$inst,
+    aes(xmin = date_start, xmax = date_end, ymin = -99, ymax = 99999),
+    fill = rgb(0,0,0,0.3),
+    color = NA
+    ) +
+  geom_rect(
+    data = inst_qex,
+    aes(
+      xmin = start,
+      xmax = end,
+      ymin = -99, 
+      ymax = 99999
+    ),
+    fill = rgb(1,0,0,0.3)
+  ) +
+  geom_line(
+    aes(
+      x = date,
+      y = deficit
+    ),
+    data = df_sub
+  ) +
+  geom_line(
+    aes(
+      x = date,
+      y = deficit_lpf
+    ),
+    data = df_sub,
+    color = "royalblue"
+  ) +
+  coord_cartesian(
+    ylim = c(0, 170),
+    xlim = c(ymd("1998-01-01"), ymd("2009-12-31"))
+    )  +
+  theme_classic() +
+  labs(x = "Date", y = "Cumulative water deficit (mm)")
+
+# smoothed Q - Q347? with Qex events (red) and CWD events (grey)
+gg2 <- ggplot() +
+  geom_rect(
+    data = out_cwd$inst,
+    aes(xmin = date_start, xmax = date_end, ymin = -99, ymax = 99999),
+    fill = rgb(0,0,0,0.3),
+    color = NA
+    ) +
+  geom_rect(
+    data = inst_qex,
+    aes(
+      xmin = start,
+      xmax = end,
+      ymin = -99, 
+      ymax = 99999
+    ),
+    fill = rgb(1,0,0,0.3)
+  ) +
+  geom_line(
+    aes(
+      x = date,
+      y = M7Q_Q347
+    ),
+    data = df_sub
+  ) +
+  coord_cartesian(
+    ylim = c(0, 60),
+    xlim = c(ymd("1998-01-01"), ymd("2009-12-31"))
+    )  +
+  geom_hline(aes(yintercept = 0), linetype = "dotted") +
+  theme_classic()
+
+plot_grid(
+  gg1, 
+  gg2,
+  ncol = 1
+)
+```
+
+This is interesting and encouraging. At least for this small subset of years and for this catchment, all Q-extreme events lie inside CWD events and the respective CWD evens are the largest ones in the record.
+
+From the observation (visualisation) above, using CWD should enable a high true positive rate and a high true negative rate. But also a high false positive rate. The challenge is to bring this down.
+
+## Modelling 
+
+Modelling the binary variable defined above (`qex`) with logistic regression. First, some visualisations.
+
+```{r}
+# logistic regression doesn't work - it's always predicting FALSE
+df_sub |> 
+  drop_na(deficit, qex) |> 
+  ggplot(aes(deficit_lpf, qex)) +
+  geom_point(alpha = 0.1) +
+  stat_smooth(
+    method = "glm",
+    method.args = list(family = binomial)
+    ) +
+  theme_classic()
+
+df_sub |> 
+  filter(catchmentnr == 2034) |> 
+  ggplot(aes(deficit_lpf, M7Q_Q347)) +
+  geom_hex(bins = 50) +
+  khroma::scale_fill_batlowW(trans = "log", reverse = TRUE) +
+  theme_classic()
+
+out_cwd$df |> 
+  filter(iinst %in% unique(out_cwd$inst$iinst)) |> 
+  ggplot(aes(deficit, M7Q_Q347, group = iinst)) +
+  geom_line(alpha = 0.3) +
+  theme_classic()
+
+out_cwd$df |> 
+  filter(iinst %in% unique(out_cwd$inst$iinst)) |> 
+  ggplot(aes(dday, M7Q_Q347, group = iinst)) +
+  geom_line(alpha = 0.3) +
+  theme_classic()
+```
+
+Fit a model with `glm(family = binomial(link = logit))`.
+
+```{r}
+logmod <- glm(
+  qex ~ deficit_lpf,
+  family = binomial(link = logit),
+  data = df_sub
+  )
+
+summ <- summary(logmod)
+res <- resid(logmod, type = "deviance")
+
+plot(density(res))
+rmse <- sqrt(mean(res^2))
+
+beta <- coef(logmod)
+
+df_sub |> 
+  drop_na(deficit_lpf, qex) |> 
+  ggplot(aes(deficit_lpf, qex)) +
+  geom_point(alpha = 0.1) +
+  geom_function(
+    fun = function(x) exp(beta[1] + beta[2] * x)/(1 + exp(beta[1] + beta[2] * x)),
+    color = "red") +
+  theme_classic()
+```
+
+**To do**: Use an appropriate model skill metric. I guess the best would be to get the area under the [(receiver-operating characteristic) curve](https://en.wikipedia.org/wiki/Receiver_operating_characteristic).
+
+For demo, I use the RMSE here with residuals calculated as `resid(..., type = "deviance")`. Wrap this into a function of tau - the characteristic time scale of the low-pass-filtered CWD.
+
+```{r}
+get_rmse <- function(ddf, tau){
+  
+  # low pass filter
+  ddf$deficit_lpf <- low_pass_filter(ddf$deficit, tau)
+
+  # model as a function of low-pass filtered  
+  logmod <- glm(
+    qex ~ deficit_lpf,
+    family = binomial(link = logit),
+    data = ddf
+    )
+
+  # get residuals and RMSE
+  res <- resid(logmod, type = "deviance")
+  rmse <- sqrt(mean(res^2))
+  
+  # but: not sure what a good metric is: https://rpubs.com/benhorvath/glm_diagnostics
+  
+  return(rmse)
+}
+
+get_rmse(df_sub, 90)
+```
+
+Evaluate the goodness of fit of a fitted logistic regression model as a function of tau.
+
+```{r}
+df_rmse <- tibble(tau = seq(1, 150, by = 2)) |> 
+  rowwise() |> 
+  mutate(rmse = get_rmse(df_sub, tau))
+```
+
+```{r}
+df_rmse |> 
+  ggplot(aes(tau, rmse)) +
+  geom_point() +
+  theme_classic()
+```
+
+Apparently, this doesn't work - no minimum. Or: best is to use tau = 1 (no filter).
+
